@@ -1,0 +1,113 @@
+from rpi_hardware_pwm import HardwarePWM
+import time
+
+# --- CONFIGURATION (50Hz Standard) ---
+PWM_FREQ = 50 
+MIN_DUTY = 2.5
+MAX_DUTY = 12.5
+
+# --- HARDWARE SETUP ---
+# Servo 1: Base (360°) -> GPIO 18 (Chan 2)
+servo_base = HardwarePWM(pwm_channel=2, hz=PWM_FREQ)
+servo_base.start(0) 
+
+# Servo 2: Tilt (180°) -> GPIO 19 (Chan 3)
+servo_tilt = HardwarePWM(pwm_channel=3, hz=PWM_FREQ)
+servo_tilt.start(0)
+
+def set_angle(servo_obj, target_angle, servo_max_range):
+    """ Instantly sets the servo to a specific angle. """
+    # Safety Clamps
+    if target_angle < 0: target_angle = 0
+    if target_angle > servo_max_range: target_angle = servo_max_range
+
+    # Calculate Duty Cycle
+    travel_ratio = target_angle / servo_max_range
+    duty = MIN_DUTY + (travel_ratio * (MAX_DUTY - MIN_DUTY))
+    servo_obj.change_duty_cycle(duty)
+
+def slow_sweep(servo_obj, start, end, max_range, delay=0.02):
+    """ Moves a single servo smoothly between angles. """
+    step = 1 if end > start else -1
+    for angle in range(int(start), int(end) + step, step):
+        set_angle(servo_obj, angle, max_range)
+        time.sleep(delay)
+
+print("--- FINAL SYSTEM COMMISSIONING TEST ---")
+
+try:
+    # --- 1) SERVO 1 (BASE) POSITIONAL TEST ---
+    print("\n[1] Testing Servo 1 (Base 360) Positions...")
+    
+    print("    -> Moving to 0°")
+    set_angle(servo_base, 0, 360)
+    time.sleep(2)
+    
+    print("    -> Moving to 180° (Center)")
+    set_angle(servo_base, 180, 360)
+    time.sleep(2)
+    
+    print("    -> Moving to 360° (Max)")
+    set_angle(servo_base, 360, 360)
+    time.sleep(2)
+
+
+    # --- 2) SERVO 2 (TILT) POSITIONAL TEST ---
+    print("\n[2] Testing Servo 2 (Tilt 180) Positions...")
+    
+    print("    -> Moving to 0° (Check clearance!)")
+    set_angle(servo_tilt, 0, 180)
+    time.sleep(2)
+    
+    print("    -> Moving to 90° (Level)")
+    set_angle(servo_tilt, 90, 180)
+    time.sleep(2)
+    
+    print("    -> Moving to 180° (Max)")
+    set_angle(servo_tilt, 180, 180)
+    time.sleep(2)
+
+
+    # --- 3) SLOW SWEEP SERVO 1 (360 -> 0) ---
+    print("\n[3] Slow Sweep: Base (360° -> 0°)...")
+    # Using small delay for visual smoothness
+    slow_sweep(servo_base, 360, 0, 360, delay=0.01)
+    time.sleep(1)
+
+
+    # --- 4) SLOW SWEEP SERVO 2 (180 -> 0) ---
+    print("\n[4] Slow Sweep: Tilt (180° -> 0°)...")
+    slow_sweep(servo_tilt, 180, 0, 180, delay=0.02)
+    time.sleep(1)
+
+
+    # --- 5) SYNCHRONIZED ASCENT (0 -> MAX) ---
+    print("\n[5] GRAND FINALE: Both Servos 0° -> Max Simultaneously...")
+    print("    (Base moves 2x faster to cover 360° while Tilt covers 180°)")
+    
+    # We loop from 0 to 180 (based on the slower Tilt servo)
+    # Base angle = Tilt angle * 2
+    for i in range(0, 181, 1):
+        tilt_angle = i
+        base_angle = i * 2  # Scales 0-180 range to 0-360 range
+        
+        set_angle(servo_base, base_angle, 360)
+        set_angle(servo_tilt, tilt_angle, 180)
+        
+        time.sleep(0.02) # Adjust speed of ascent here
+
+    print("\nTest Complete. Holding Max Positions.")
+    time.sleep(2)
+
+except KeyboardInterrupt:
+    print("\nTest Aborted by User.")
+
+finally:
+    print("\nParking motors safely...")
+    set_angle(servo_base, 180, 360) # Park Base Center
+    set_angle(servo_tilt, 90, 180)  # Park Tilt Level
+    time.sleep(1)
+    
+    servo_base.stop()
+    servo_tilt.stop()
+    print("System Shutdown.")

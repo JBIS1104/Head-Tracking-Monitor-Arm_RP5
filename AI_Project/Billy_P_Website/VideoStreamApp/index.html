@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IP Cam MJPEG Uploader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Live Camera Uploader</p>
+        <h1>iPad to MJPEG (HTTP)</h1>
+        <p class="lede">
+          Capture camera frames in the browser and upload them to your laptop MJPEG server.
+        </p>
+      </div>
+      <div class="status" id="status">Idle</div>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h2>Camera Preview</h2>
+        <video id="preview" autoplay playsinline muted></video>
+        <canvas id="canvas" class="hidden"></canvas>
+      </div>
+
+      <div class="card">
+        <h2>Stream Settings</h2>
+        <label>
+          Server URL
+          <input id="serverUrl" type="url" placeholder="Auto: same origin" />
+        </label>
+        <label>
+          Resolution
+          <select id="resolution">
+            <option value="1920x1080">1920 x 1080 (Full HD)</option>
+            <option value="1600x900">1600 x 900</option>
+            <option value="1366x768">1366 x 768</option>
+            <option value="1280x720">1280 x 720 (HD)</option>
+            <option value="1024x576">1024 x 576</option>
+            <option value="960x540">960 x 540</option>
+            <option value="854x480">854 x 480</option>
+            <option value="640x480">640 x 480</option>
+            <option value="480x360" selected>480 x 360</option>
+            <option value="320x240">320 x 240</option>
+            <option value="240x180">240 x 180</option>
+            <option value="160x120">160 x 120</option>
+          </select>
+        </label>
+        <label>
+          Frame rate
+          <select id="fps">
+            <option value="1">1 fps</option>
+            <option value="2">2 fps</option>
+            <option value="5">5 fps</option>
+            <option value="8">8 fps</option>
+            <option value="10">10 fps</option>
+            <option value="15" selected>15 fps</option>
+            <option value="20">20 fps</option>
+            <option value="30">30 fps</option>
+          </select>
+        </label>
+        <label class="row">
+          <input id="grayscale" type="checkbox" />
+          Send grayscale frames
+        </label>
+        <label>
+          JPEG quality
+          <input id="quality" type="range" min="0.3" max="0.95" step="0.05" value="0.7" />
+        </label>
+        <div class="hint">
+          Center Stage cannot be controlled from a web page. This needs a native iOS app.
+        </div>
+        <div class="actions">
+          <button id="start">Start</button>
+          <button id="stop" disabled>Stop</button>
+        </div>
+        <div class="stats" id="actualSettings">
+          <strong>Actual camera settings</strong>
+          <div id="actualResolution">Resolution: -</div>
+          <div id="actualFps">Frame rate: -</div>
+          <div id="streamStats">Sent FPS: - | Upload: - ms</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Viewer</h2>
+        <p class="lede">Open this on your laptop to view the MJPEG stream.</p>
+        <code id="viewerUrl">(auto)</code>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
