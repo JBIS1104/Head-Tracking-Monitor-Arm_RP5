@@ -1,4 +1,6 @@
-#"/home/billyp/Documents/Face Detection/.venv-gui/bin/python" "/home/billyp/Documents/Face Detection/face_detection_regent_style.py"
+# Bash:
+# source "/home/billyp/Documents/Face Detection/.venv-gui/bin/activate"
+# python "/home/billyp/Documents/Face Detection/face_detection_regent_style.py"
 
 
 import argparse

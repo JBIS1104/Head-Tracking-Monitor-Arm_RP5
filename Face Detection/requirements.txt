@@ -1,0 +1,6 @@
+numpy
+opencv-python
+requests
+urllib3
+gpiozero
+lgpio

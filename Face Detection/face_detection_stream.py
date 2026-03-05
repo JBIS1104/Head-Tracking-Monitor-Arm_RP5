@@ -1,3 +1,7 @@
+# Bash:
+# source "/home/billyp/Documents/Face Detection/.venv-gui/bin/activate"
+# python "/home/billyp/Documents/Face Detection/face_detection_stream.py" --show
+
 import argparse
 import os
 import sys

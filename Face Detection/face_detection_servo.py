@@ -1,4 +1,7 @@
-#/bin/python "/home/billyp/Documents/Face Detection/face_detection_servo.py" --insecure
+# Bash:
+# source "/home/billyp/Documents/Face Detection/.venv-gui/bin/activate"
+# python "/home/billyp/Documents/Face Detection/face_detection_servo.py" --insecure
+
 import argparse
 import time
 from pathlib import Path
