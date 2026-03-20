@@ -1,0 +1,38 @@
+# Virtual environments
+.venv/
+.venv-gui/
+venv/
+venv_sys/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model binaries (large files — store separately)
+*.bin
+*.onnx
+*.pt
+*.weights
+
+# Compiled/generated
+*.egg-info/
+dist/
+build/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Encodings / trained data
+output/encodings.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Recordings
+*.avi
+*.mp4
+capture.png

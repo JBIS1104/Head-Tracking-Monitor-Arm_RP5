@@ -4,6 +4,7 @@ This folder contains:
 - `face_detection_regent_style.py`
 - `face_detection_stream.py`
 - `face_detection_servo.py`
+- `face_detection_yolo_face.py`
 
 ## 1) Create and activate virtual environment
 
@@ -26,6 +27,7 @@ pip install -r requirements.txt
 python face_detection_regent_style.py
 python face_detection_stream.py --show
 python face_detection_servo.py --insecure
+python face_detection_yolo_face.py --url "https://192.168.1.111:8002/mjpeg" --insecure
 ```
 
 ## Notes for Raspberry Pi

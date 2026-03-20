@@ -2,5 +2,6 @@ numpy
 opencv-python
 requests
 urllib3
+ultralytics
 gpiozero
 lgpio
