@@ -1,4 +1,4 @@
-#python -c "from mjpeg_server.app import app; app.run(host='0.0.0.0', port=8002, threaded=True, ssl_context='adhoc')"
+#cd "/home/billyp/Documents/Server" && python -c "from mjpeg_server.app import app; app.run(host='0.0.0.0', port=8002, threaded=True, ssl_context='adhoc')"
 #ps -p $(pgrep -f "mjpeg_server/app.py") -o %cpu,%mem,rss,vsz,cmd
 from __future__ import annotations
 

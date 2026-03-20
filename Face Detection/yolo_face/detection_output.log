@@ -1,0 +1,9 @@
+[ERROR:0@0.302] global ./modules/dnn/src/onnx/onnx_importer.cpp (1018) handleNode DNN/ONNX: ERROR during processing node with 2 inputs and 2 outputs: [Split]:(onnx_node!/model.22/Split) from domain='ai.onnx'
+libpng warning: iCCP: known incorrect sRGB profile
+libpng warning: iCCP: known incorrect sRGB profile
+libpng warning: iCCP: known incorrect sRGB profile
+libpng warning: iCCP: known incorrect sRGB profile
+libpng warning: iCCP: known incorrect sRGB profile
+ultralytics not available; falling back to OpenCV Haar cascade backend.
+Live detection started (backend=haar, model=models/yolov8n-face.pt, conf=0.6, source=https://192.168.1.111:8002/mjpeg) — press 'q' to quit.
+Reached max_frames=100; stopping.

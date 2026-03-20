@@ -1,0 +1,5 @@
+path: /home/billyp/Documents/Face Detection/yolo_face/face_detection_dataset
+train: images/train
+val: images/val
+nc: 1
+names: ['face']

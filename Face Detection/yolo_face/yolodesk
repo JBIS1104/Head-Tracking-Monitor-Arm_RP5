@@ -1,0 +1,736 @@
+
+
+"""
+YOLO-Face face detector — uses pre-trained YOLOv8/v11/v12 face models.
+Repo: https://github.com/akanametov/yolo-face
+
+
+Requires:
+    pip install ultralytics opencv-python
+
+
+Model weights are downloaded automatically on first use.
+Available models (nano is default — fastest/smallest):
+    yolov8n-face.pt  | yolov8m-face.pt  | yolov8l-face.pt
+    yolov11n-face.pt | yolov11m-face.pt | yolov11l-face.pt
+    yolov12n-face.pt | yolov12m-face.pt | yolov12l-face.pt
+"""
+
+
+import argparse
+import os
+import threading
+import urllib.request
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from typing import Any
+
+
+import cv2
+import numpy as np
+
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+
+
+MODEL_BASE_URL = "https://github.com/YapaLab/yolo-face/releases/download/1.0.0/"
+DEFAULT_MODEL = "yolov8n-face.pt"
+DEFAULT_BACKEND = "auto"
+HAAR_CASCADE_PATH = BASE_DIR.parent / "data" / "haarcascade_frontalface_default.xml"
+ONNX_BASE_URL = "https://github.com/lindevs/yolov8-face/releases/download/1.0.1/"
+DEFAULT_ONNX_MODEL = "yolov8n-face-lindevs.onnx"
+DEFAULT_ONNX_INPUT_SIZE = 640
+
+
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class MjpegBroadcaster:
+    def __init__(self, host: str = "0.0.0.0", port: int = 8081):
+        self.host = host
+        self.port = port
+        self._last_jpeg: bytes | None = None
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._stopped = False
+        self._server = self._build_server()
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def _build_server(self):
+        broadcaster = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path in ("/", "/index.html"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body style='margin:0;background:#000;'>"
+                        b"<img src='/stream.mjpeg' style='width:100%;height:auto;'/>"
+                        b"</body></html>"
+                    )
+                    return
+
+                if self.path != "/stream.mjpeg":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                self.send_response(200)
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Connection", "close")
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.end_headers()
+
+                while True:
+                    with broadcaster._condition:
+                        broadcaster._condition.wait_for(
+                            lambda: broadcaster._last_jpeg is not None or broadcaster._stopped
+                        )
+                        if broadcaster._stopped:
+                            break
+                        frame = broadcaster._last_jpeg
+
+                    if frame is None:
+                        continue
+                    try:
+                        self.wfile.write(b"--frame\r\n")
+                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                        self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
+                        self.wfile.write(frame)
+                        self.wfile.write(b"\r\n")
+                    except Exception:
+                        break
+
+            def log_message(self, format, *args):
+                return
+
+        return _ThreadingHTTPServer((self.host, self.port), Handler)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def update(self, bgr_frame) -> None:
+        ok, enc = cv2.imencode(".jpg", bgr_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return
+        with self._condition:
+            self._last_jpeg = enc.tobytes()
+            self._condition.notify_all()
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+
+def highgui_available() -> bool:
+    try:
+        cv2.namedWindow("_cv_test_")
+        cv2.destroyWindow("_cv_test_")
+        return True
+    except Exception:
+        return False
+
+
+
+
+# ── Backend/model helpers ────────────────────────────────────────────────────
+def _ultralytics_available() -> bool:
+    try:
+        from ultralytics import YOLO  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _load_haar_cascade() -> cv2.CascadeClassifier:
+    if not HAAR_CASCADE_PATH.exists():
+        raise FileNotFoundError(
+            f"Haar cascade file not found: {HAAR_CASCADE_PATH}"
+        )
+    cascade = cv2.CascadeClassifier(str(HAAR_CASCADE_PATH))
+    if cascade.empty():
+        raise RuntimeError(f"Failed to load Haar cascade: {HAAR_CASCADE_PATH}")
+    return cascade
+
+
+def _load_onnx_net(onnx_model_name: str = DEFAULT_ONNX_MODEL) -> cv2.dnn.Net:
+    onnx_path = MODELS_DIR / onnx_model_name
+    if not onnx_path.exists():
+        url = ONNX_BASE_URL + onnx_model_name
+        print(f"Downloading {onnx_model_name} from {url} ...")
+        urllib.request.urlretrieve(url, onnx_path)
+        print(f"Saved to {onnx_path}")
+    net = cv2.dnn.readNetFromONNX(str(onnx_path))
+    return net
+
+
+def _preprocess_yolov8_onnx(frame, size: int = DEFAULT_ONNX_INPUT_SIZE):
+    h, w = frame.shape[:2]
+    scale = min(size / w, size / h)
+    nw, nh = int(round(w * scale)), int(round(h * scale))
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    dw = (size - nw) // 2
+    dh = (size - nh) // 2
+    canvas[dh : dh + nh, dw : dw + nw] = resized
+
+    blob = cv2.dnn.blobFromImage(
+        canvas,
+        scalefactor=1.0 / 255.0,
+        size=(size, size),
+        swapRB=True,
+        crop=False,
+    )
+    return blob, scale, dw, dh
+
+
+def _run_onnx_face_detection(frame, net: cv2.dnn.Net, conf: float):
+    blob, scale, dw, dh = _preprocess_yolov8_onnx(frame, DEFAULT_ONNX_INPUT_SIZE)
+    net.setInput(blob)
+    pred = net.forward()
+
+    # Normalize to NxC matrix where C >= 5.
+    if pred.ndim == 3:
+        if pred.shape[1] < pred.shape[2]:
+            pred = np.transpose(pred, (0, 2, 1))
+        pred = pred[0]
+    elif pred.ndim == 2:
+        pass
+    else:
+        pred = pred.reshape(-1, pred.shape[-1])
+
+    h, w = frame.shape[:2]
+    boxes = []
+    scores = []
+
+    for row in pred:
+        if row.shape[0] < 5:
+            continue
+        cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+        if row.shape[0] == 5:
+            score = float(row[4])
+        else:
+            score = float(np.max(row[4:]))
+        if score < conf:
+            continue
+
+        x1 = (cx - bw / 2.0 - dw) / scale
+        y1 = (cy - bh / 2.0 - dh) / scale
+        x2 = (cx + bw / 2.0 - dw) / scale
+        y2 = (cy + bh / 2.0 - dh) / scale
+
+        x1 = int(max(0, min(w - 1, x1)))
+        y1 = int(max(0, min(h - 1, y1)))
+        x2 = int(max(0, min(w - 1, x2)))
+        y2 = int(max(0, min(h - 1, y2)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        boxes.append([x1, y1, x2 - x1, y2 - y1])
+        scores.append(score)
+
+    indices = cv2.dnn.NMSBoxes(boxes, scores, conf, 0.45)
+    detections: list[tuple[int, int, int, int, float]] = []
+    annotated = frame.copy()
+
+    if len(indices) > 0:
+        for idx in np.array(indices).flatten().tolist():
+            x, y, bw, bh = boxes[idx]
+            x1, y1, x2, y2 = int(x), int(y), int(x + bw), int(y + bh)
+            score = float(scores[idx])
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.putText(
+                annotated,
+                f"face {score:.2f}",
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
+            detections.append((x1, y1, x2, y2, score))
+
+    return annotated, detections
+
+
+def resolve_backend(backend: str = DEFAULT_BACKEND) -> str:
+    backend = backend.lower()
+    if backend not in {"auto", "yolo", "onnx", "haar"}:
+        raise ValueError("--backend must be one of: auto, yolo, onnx, haar")
+
+    if backend == "yolo":
+        if not _ultralytics_available():
+            raise RuntimeError(
+                "YOLO backend requested, but ultralytics is unavailable in this venv. "
+                "Use --backend haar or install ultralytics+torch on a compatible platform."
+            )
+        return "yolo"
+
+    if backend == "onnx":
+        return "onnx"
+
+    if backend == "haar":
+        _load_haar_cascade()
+        return "haar"
+
+    # auto
+    if _ultralytics_available():
+        return "yolo"
+    try:
+        _load_onnx_net(DEFAULT_ONNX_MODEL)
+        print("ultralytics not available; using ONNX backend.")
+        return "onnx"
+    except Exception:
+        pass
+    _load_haar_cascade()
+    print("ultralytics not available; falling back to OpenCV Haar cascade backend.")
+    return "haar"
+
+
+def load_model(
+    model_name: str = DEFAULT_MODEL,
+    backend: str = DEFAULT_BACKEND,
+    onnx_model_name: str = DEFAULT_ONNX_MODEL,
+) -> tuple[str, Any]:
+    selected = resolve_backend(backend)
+    if selected == "haar":
+        return selected, _load_haar_cascade()
+    if selected == "onnx":
+        return selected, _load_onnx_net(onnx_model_name)
+
+    from ultralytics import YOLO
+
+    model_path = MODELS_DIR / model_name
+    if not model_path.exists():
+        url = MODEL_BASE_URL + model_name
+        print(f"Downloading {model_name} from {url} ...")
+        urllib.request.urlretrieve(url, model_path)
+        print(f"Saved to {model_path}")
+    return selected, YOLO(str(model_path))
+
+
+def run_face_detection(frame, backend: str, model: Any, conf: float) -> tuple[Any, list[tuple[int, int, int, int, float]]]:
+    if backend == "yolo":
+        results = model(frame, conf=conf, verbose=False)
+        result = results[0]
+        annotated = result.plot(line_width=2)
+        detections: list[tuple[int, int, int, int, float]] = []
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            score = float(box.conf[0])
+            detections.append((x1, y1, x2, y2, score))
+        return annotated, detections
+
+    if backend == "onnx":
+        return _run_onnx_face_detection(frame=frame, net=model, conf=conf)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    min_neighbors = max(3, int(3 + conf * 10))
+    faces = model.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=min_neighbors,
+        minSize=(30, 30),
+    )
+    annotated = frame.copy()
+    detections = []
+    for (x, y, w, h) in faces:
+        x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            annotated,
+            "face",
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+        detections.append((x1, y1, x2, y2, 1.0))
+    return annotated, detections
+
+
+
+
+# ── Image detection ───────────────────────────────────────────────────────────
+def detect_image(
+    image_path: str,
+    model_name: str = DEFAULT_MODEL,
+    onnx_model_name: str = DEFAULT_ONNX_MODEL,
+    backend: str = DEFAULT_BACKEND,
+    conf: float = 0.25,
+    save_path: str | None = None,
+) -> None:
+    """
+    Run face detection on a single image.
+    Displays the annotated result; optionally saves it to `save_path`.
+    """
+    frame = cv2.imread(image_path)
+    if frame is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+
+    selected_backend, model = load_model(
+        model_name=model_name,
+        backend=backend,
+        onnx_model_name=onnx_model_name,
+    )
+    annotated, detections = run_face_detection(
+        frame=frame,
+        backend=selected_backend,
+        model=model,
+        conf=conf,
+    )
+
+    n_faces = len(detections)
+    print(f"Detected {n_faces} face(s) in '{image_path}'")
+    print(f"Backend: {selected_backend}")
+    for i, (x1, y1, x2, y2, score) in enumerate(detections):
+        print(f"  face_{i + 1}: confidence={score:.4f}, box=[{x1},{y1},{x2},{y2}]")
+
+
+    if save_path:
+        cv2.imwrite(save_path, annotated)
+        print(f"Annotated image saved to: {save_path}")
+    else:
+        if highgui_available():
+            cv2.imshow("YOLO-Face Detection", annotated)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        else:
+            fallback_path = str(BASE_DIR / "detected_output.jpg")
+            cv2.imwrite(fallback_path, annotated)
+            print(f"No GUI support in OpenCV. Saved result to: {fallback_path}")
+
+
+
+
+# ── Live webcam detection ─────────────────────────────────────────────────────
+def live_detection(
+    model_name: str = DEFAULT_MODEL,
+    onnx_model_name: str = DEFAULT_ONNX_MODEL,
+    backend: str = DEFAULT_BACKEND,
+    conf: float = 0.25,
+    source: int | str = 0,
+    insecure: bool = False,
+    display: bool = True,
+    max_frames: int | None = None,
+    serve: bool = False,
+    serve_host: str = "0.0.0.0",
+    serve_port: int = 8081,
+) -> None:
+    """
+    Run YOLO-face detection on a live webcam feed.
+    Press 'q' to quit.
+    """
+    selected_backend, model = load_model(
+        model_name=model_name,
+        backend=backend,
+        onnx_model_name=onnx_model_name,
+    )
+    print(
+        f"Live detection started (backend={selected_backend}, model={model_name}, conf={conf}, source={source}) — press 'q' to quit."
+    )
+
+    if display and not highgui_available():
+        print("OpenCV HighGUI is unavailable; switching to no-display mode.")
+        display = False
+
+    broadcaster: MjpegBroadcaster | None = None
+    if serve:
+        broadcaster = MjpegBroadcaster(host=serve_host, port=serve_port)
+        broadcaster.start()
+        print(f"Processed stream available at: http://{serve_host}:{serve_port}/")
+
+    if insecure and isinstance(source, str) and source.startswith("https://"):
+        # Used by OpenCV's FFmpeg backend to skip TLS certificate verification.
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "tls_verify;0"
+
+    if isinstance(source, str):
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        if not cap.isOpened() and source.startswith(("http://", "https://")):
+            print("OpenCV could not open URL source; trying requests-based MJPEG reader...")
+            _live_detection_mjpeg_requests(
+                source=source,
+                insecure=insecure,
+                backend=selected_backend,
+                model=model,
+                conf=conf,
+                display=display,
+                max_frames=max_frames,
+                broadcaster=broadcaster,
+            )
+            return
+    else:
+        cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video source: {source}")
+
+
+    try:
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame.")
+                break
+
+
+            annotated, detections = run_face_detection(
+                frame=frame,
+                backend=selected_backend,
+                model=model,
+                conf=conf,
+            )
+
+            n_faces = len(detections)
+            cv2.putText(
+                annotated,
+                f"Faces: {n_faces}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2,
+            )
+
+            if display:
+                cv2.imshow("YOLO-Face — Live Detection", annotated)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+            else:
+                if frame_idx % 30 == 0:
+                    print(f"frame={frame_idx} faces={n_faces}")
+
+            if broadcaster is not None:
+                broadcaster.update(annotated)
+
+            frame_idx += 1
+            if max_frames is not None and frame_idx >= max_frames:
+                print(f"Reached max_frames={max_frames}; stopping.")
+                break
+    finally:
+        cap.release()
+        if display:
+            cv2.destroyAllWindows()
+        if broadcaster is not None:
+            broadcaster.stop()
+
+
+def _live_detection_mjpeg_requests(
+    source: str,
+    insecure: bool,
+    backend: str,
+    model: Any,
+    conf: float,
+    display: bool,
+    max_frames: int | None,
+    broadcaster: MjpegBroadcaster | None,
+) -> None:
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError(
+            "requests package is required for MJPEG URL fallback. Install with: pip install requests"
+        ) from exc
+
+    try:
+        with requests.get(source, stream=True, verify=not insecure, timeout=10) as response:
+            response.raise_for_status()
+            bytes_buf = b""
+            frame_idx = 0
+            for chunk in response.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                bytes_buf += chunk
+                start = bytes_buf.find(b"\xff\xd8")
+                end = bytes_buf.find(b"\xff\xd9")
+                if start != -1 and end != -1 and end > start:
+                    jpg = bytes_buf[start : end + 2]
+                    bytes_buf = bytes_buf[end + 2 :]
+
+                    frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
+
+                    annotated, detections = run_face_detection(
+                        frame=frame,
+                        backend=backend,
+                        model=model,
+                        conf=conf,
+                    )
+
+                    n_faces = len(detections)
+                    cv2.putText(
+                        annotated,
+                        f"Faces: {n_faces}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9,
+                        (0, 255, 0),
+                        2,
+                    )
+
+                    if display:
+                        cv2.imshow("YOLO-Face — Live Detection", annotated)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
+                    else:
+                        if frame_idx % 30 == 0:
+                            print(f"frame={frame_idx} faces={n_faces}")
+
+                    if broadcaster is not None:
+                        broadcaster.update(annotated)
+
+                    frame_idx += 1
+                    if max_frames is not None and frame_idx >= max_frames:
+                        print(f"Reached max_frames={max_frames}; stopping.")
+                        break
+    finally:
+        if display:
+            cv2.destroyAllWindows()
+
+
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="YOLO-Face face detector",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Model filename (e.g. yolov8n-face.pt, yolov11n-face.pt, yolov12n-face.pt)",
+    )
+    parser.add_argument(
+        "--conf", type=float, default=0.25, help="Detection confidence threshold"
+    )
+    parser.add_argument(
+        "--backend",
+        default=DEFAULT_BACKEND,
+        choices=["auto", "yolo", "onnx", "haar"],
+        help="Detection backend",
+    )
+    parser.add_argument(
+        "--onnx-model",
+        default=DEFAULT_ONNX_MODEL,
+        help="ONNX model filename used by --backend onnx",
+    )
+
+
+    subparsers = parser.add_subparsers(dest="command")
+
+
+    # detect
+    detect_p = subparsers.add_parser("detect", help="Detect faces in an image")
+    detect_p.add_argument("image", help="Path to input image")
+    detect_p.add_argument(
+        "--save",
+        default=None,
+        help="Optional output path for annotated image",
+    )
+
+    # live
+    live_p = subparsers.add_parser("live", help="Run live face detection from camera or URL")
+    live_p.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+        help="Camera index for cv2.VideoCapture (used if --source is not set)",
+    )
+    live_p.add_argument(
+        "--source",
+        default=None,
+        help="Video source (camera index like '0' or stream URL like https://.../mjpeg)",
+    )
+    live_p.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Trust insecure HTTPS certificates for stream sources",
+    )
+    live_p.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Run without opening GUI windows (useful on headless systems)",
+    )
+    live_p.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Optional frame limit for live mode",
+    )
+    live_p.add_argument(
+        "--serve",
+        action="store_true",
+        help="Serve processed video as MJPEG at /stream.mjpeg",
+    )
+    live_p.add_argument(
+        "--serve-host",
+        default="0.0.0.0",
+        help="Host for processed MJPEG server",
+    )
+    live_p.add_argument(
+        "--serve-port",
+        type=int,
+        default=8081,
+        help="Port for processed MJPEG server",
+    )
+
+    args = parser.parse_args()
+    if args.command is None:
+        parser.print_help()
+        parser.exit(2)
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    if args.command == "detect":
+        detect_image(
+            image_path=args.image,
+            model_name=args.model,
+            onnx_model_name=args.onnx_model,
+            backend=args.backend,
+            conf=args.conf,
+            save_path=args.save,
+        )
+    elif args.command == "live":
+        if args.source is None:
+            source: int | str = args.camera
+        else:
+            source = int(args.source) if args.source.isdigit() else args.source
+
+        live_detection(
+            model_name=args.model,
+            onnx_model_name=args.onnx_model,
+            backend=args.backend,
+            conf=args.conf,
+            source=source,
+            insecure=args.insecure,
+            display=not args.no_display,
+            max_frames=args.max_frames,
+            serve=args.serve,
+            serve_host=args.serve_host,
+            serve_port=args.serve_port,
+        )
+
+
+if __name__ == "__main__":
+    main()
