@@ -29,6 +29,7 @@ Tuning:
 """
 
 import argparse
+import subprocess
 import sys
 import threading
 import time
@@ -45,7 +46,9 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # ── Default Parameters ────────────────────────────────────────────────────────
 
 DEFAULT_MODEL   = "models/yolov8n-face_ncnn_model"
-DEFAULT_SOURCE  = "https://192.168.1.111:8002/mjpeg"
+# Loopback by default: the MJPEG server runs on this same Pi, and loopback
+# survives DHCP/network changes. Pass --source to override for remote streams.
+DEFAULT_SOURCE  = "https://127.0.0.1:8002/mjpeg"
 DEFAULT_CONF    = 0.45
 RES_W, RES_H    = 640, 480
 
@@ -56,25 +59,60 @@ ACT_DIR_PIN = 20   # linear actuator: direction (HR8833)
 ACT_EN_PIN  = 21   # linear actuator: enable
 
 # Servo PWM
-PWM_FREQ      = 400   # Hz — matches existing working setup
+PWM_FREQ      = 400   # Hz
 SERVO_MIN     = 0.0
 SERVO_MAX     = 1.0
 SERVO_NEUTRAL = 0.5
+SERVO_SLEEP_PITCH = 0.23    # pitch tilts down when going to sleep
+SERVO_VERTICAL_START = 0.65   # pitch starting position (from face_detection_servo)
+SERVO_RAMP_STEP     = 0.003   # duty change per ramp step
+SERVO_RAMP_INTERVAL = 0.03    # seconds between ramp steps
+MAX_SLEW            = 0.015   # max duty change per frame
 
-# PID defaults (tune via command line)
-DEFAULT_KP = 0.35
-DEFAULT_KI = 0.0002
-DEFAULT_KD = 0.10
+# ── PID Profiles ─────────────────────────────────────────────────────────────
+# Select with --profile <name>
+PID_PROFILES = {
+    "responsive": {     # Fast response, good for low-latency streams
+        "kp": 0.06, "ki": 0.0002, "kd": 0.18,
+        "ema": 0.65, "slew": 0.014,
+        "dz_x": 0.16, "dz_y": 0.12,
+    },
+    "smooth": {         # Balanced — smooth but tracks well
+        "kp": 0.04, "ki": 0.00015, "kd": 0.22,
+        "ema": 0.80, "slew": 0.010,
+        "dz_x": 0.18, "dz_y": 0.13,
+    },
+    "cinematic": {      # Slow, buttery — good for video/presentation
+        "kp": 0.025, "ki": 0.0001, "kd": 0.30,
+        "ema": 0.90, "slew": 0.006,
+        "dz_x": 0.22, "dz_y": 0.15,
+    },
+}
+DEFAULT_PROFILE = "smooth"
+
+# Fallback defaults (used if no profile selected)
+DEFAULT_KP = 0.04
+DEFAULT_KI = 0.00015
+DEFAULT_KD = 0.22
 
 # Deadzone: fraction of frame dimension either side of centre
-DEFAULT_DZ_X = 0.08
-DEFAULT_DZ_Y = 0.08
+DEFAULT_DZ_X = 0.14
+DEFAULT_DZ_Y = 0.10
 
 # EMA smoothing on face position (higher = smoother but slower to respond)
-DEFAULT_EMA = 0.4
+DEFAULT_EMA = 0.80
+
+# Camera offset: iPad camera is on the left side, so shift the tracking
+# centre leftward. Fraction of frame width (positive = shift left).
+CAMERA_OFFSET_X = 0.08
 
 # Frames to hold last position after losing the face before resetting
 HOLD_FRAMES = 25
+
+# Centering nudge: once face has been in the deadzone for this many
+# consecutive frames, slowly creep the servo toward true center.
+CENTER_SETTLE_FRAMES = 8    # frames in deadzone before centering starts
+CENTER_SPEED = 0.0008       # duty nudge per frame — very slow creep
 
 # Linear actuator
 ACT_DEADZONE_Y = 0.22   # only trigger actuator if Y error > this fraction of frame
@@ -84,6 +122,15 @@ ACT_COOLDOWN_S = 1.2    # s between pulses (prevents oscillation)
 # ── NCNN Face Detection ───────────────────────────────────────────────────────
 
 INPUT_SIZE = 640
+
+# Keypoint colours (BGR): left eye, right eye, nose, left mouth, right mouth
+KPT_COLORS = [
+    (255, 255,   0),  # left eye   — cyan
+    (255, 255,   0),  # right eye  — cyan
+    (  0, 255, 255),  # nose       — yellow
+    (  0, 165, 255),  # left mouth — orange
+    (  0, 165, 255),  # right mouth— orange
+]
 
 
 def load_model(model_dir: str) -> ncnn.Net:
@@ -150,10 +197,20 @@ def detect_faces(net: ncnn.Net, frame: np.ndarray, conf_thresh: float) -> list[d
         dy1 = float(max(0, min(h, (y1[i] - pad_h) / scale)))
         dx2 = float(max(0, min(w, (x2[i] - pad_w) / scale)))
         dy2 = float(max(0, min(h, (y2[i] - pad_h) / scale)))
+        # Extract 5 keypoints (x, y, visibility), each in model space → frame space
+        kpts = []
+        for k in range(5):
+            kx_raw = float(filtered[5 + k * 3,     i])
+            ky_raw = float(filtered[5 + k * 3 + 1, i])
+            kv     = float(filtered[5 + k * 3 + 2, i])
+            kx = float(max(0, min(w, (kx_raw - pad_w) / scale)))
+            ky = float(max(0, min(h, (ky_raw - pad_h) / scale)))
+            kpts.append((kx, ky, kv))
         results.append({
             "bbox": (int(dx1), int(dy1), int(dx2), int(dy2)),
             "conf": float(scores[i]),
             "area": (dx2 - dx1) * (dy2 - dy1),
+            "keypoints": kpts,
         })
     return results
 
@@ -195,13 +252,14 @@ class MjpegReader:
     """Reads MJPEG stream in a background thread. Always provides latest frame."""
 
     def __init__(self, url: str, res: tuple[int, int], insecure: bool):
-        self.url      = url
-        self.res      = res
-        self.insecure = insecure
-        self._frame   = None
-        self._lock    = threading.Lock()
-        self._stop    = threading.Event()
-        self._thread  = threading.Thread(target=self._run, daemon=True)
+        self.url       = url
+        self.res       = res
+        self.insecure  = insecure
+        self._frame    = None
+        self._frame_id = 0
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+        self._thread   = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self._thread.start()
@@ -209,9 +267,10 @@ class MjpegReader:
     def stop(self):
         self._stop.set()
 
-    def get_frame(self) -> np.ndarray | None:
+    def get_frame(self) -> tuple[np.ndarray | None, int]:
+        """Returns (frame, frame_id). Compare frame_id to detect new frames."""
         with self._lock:
-            return self._frame
+            return self._frame, self._frame_id
 
     def _run(self):
         resW, resH = self.res
@@ -222,34 +281,151 @@ class MjpegReader:
                     verify=not self.insecure, timeout=(3, 10)
                 )
                 resp.raise_for_status()
-                buf, last_end = b"", 0
+                buf = b""
                 for chunk in resp.iter_content(chunk_size=32768):
                     if self._stop.is_set():
                         return
                     buf += chunk
-                    while True:
-                        s = buf.find(b"\xff\xd8", last_end)
-                        if s == -1:
-                            if len(buf) > 512 * 1024:
-                                buf = buf[-256 * 1024:]
-                            last_end = 0
-                            break
-                        e = buf.find(b"\xff\xd9", s + 2)
-                        if e == -1:
-                            break
-                        jpg = buf[s:e + 2]
-                        last_end = e + 2
-                        img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-                        if img is not None:
-                            ih, iw = img.shape[:2]
-                            if (iw, ih) != (resW, resH):
-                                img = cv2.resize(img, (resW, resH), cv2.INTER_LINEAR)
-                            with self._lock:
-                                self._frame = img
+                    # Jump to the LAST complete JPEG in the buffer — discard backlogged frames
+                    end = buf.rfind(b"\xff\xd9")
+                    if end == -1:
+                        continue
+                    start = buf.rfind(b"\xff\xd8", 0, end)
+                    if start == -1:
+                        continue
+                    jpg = buf[start:end + 2]
+                    buf = buf[end + 2:]  # trim everything up to and including this frame
+                    img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                    if img is not None:
+                        ih, iw = img.shape[:2]
+                        if (iw, ih) != (resW, resH):
+                            img = cv2.resize(img, (resW, resH), cv2.INTER_LINEAR)
+                        with self._lock:
+                            self._frame = img
+                            self._frame_id += 1
             except Exception as e:
                 if not self._stop.is_set():
                     print(f"[MJPEG] {e} — retrying in 2s")
                     time.sleep(2)
+
+
+# ── Hardware PWM (sysfs) ─────────────────────────────────────────────────────
+
+# RPi 5 RP1 PWM channel mapping (from `pinctrl funcs`)
+#   GPIO 18 → PWM0_CHAN2 → pwmchip0/pwm2  (pinctrl alt: a3)
+#   GPIO 13 → PWM0_CHAN1 → pwmchip0/pwm1  (pinctrl alt: a0)
+HW_PWM_CHANNELS = {18: 2, 13: 1}
+HW_PWM_PIN_ALT  = {18: "a3", 13: "a0"}
+
+class HardwarePWM:
+    """Jitter-free hardware PWM via /sys/class/pwm (RP1 on RPi 5).
+    Requires running as root (sudo) — sysfs blocks non-root writes regardless
+    of file permissions. Keeps the duty_cycle fd open for zero-overhead writes."""
+
+    def __init__(self, gpio_pin: int, frequency: int = 400):
+        channel = HW_PWM_CHANNELS.get(gpio_pin)
+        if channel is None:
+            raise ValueError(f"GPIO {gpio_pin} has no hardware PWM mapping")
+        self._base = f"/sys/class/pwm/pwmchip0/pwm{channel}"
+        self._period_ns = int(1e9 / frequency)
+        self._value = 0.0
+
+        # Set pin to PWM alt function via pinctrl
+        alt = HW_PWM_PIN_ALT.get(gpio_pin)
+        if alt:
+            subprocess.run(["pinctrl", "set", str(gpio_pin), alt],
+                           check=True, capture_output=True)
+
+        # Export channel if not already
+        if not Path(self._base).exists():
+            Path("/sys/class/pwm/pwmchip0/export").write_text(str(channel))
+            time.sleep(0.1)
+
+        self._attr_write("period", str(self._period_ns))
+        self._attr_write("duty_cycle", "0")
+        self._attr_write("enable", "1")
+
+        # Keep duty_cycle fd open for fast writes (no open/close per frame)
+        self._duty_fd = open(f"{self._base}/duty_cycle", "w")
+
+    def _attr_write(self, attr: str, val: str):
+        with open(f"{self._base}/{attr}", "w") as f:
+            f.write(val)
+            f.flush()
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    @value.setter
+    def value(self, v: float):
+        v = max(0.0, min(1.0, v))
+        self._value = v
+        self._duty_fd.seek(0)
+        self._duty_fd.write(str(int(v * self._period_ns)))
+        self._duty_fd.flush()
+
+    def close(self):
+        self._duty_fd.close()
+        self._attr_write("enable", "0")
+
+
+# ── Smooth Servo Interpolator ────────────────────────────────────────────────
+
+class SmoothServo:
+    """Inter-frame interpolator for servo PWM.
+
+    The detection loop runs at ~4 FPS (one update every ~250 ms). Writing the
+    PWM directly from that loop produces visibly stepped motion: the servo
+    jumps, sits for 250 ms, jumps again. This wrapper runs a background thread
+    at ~200 Hz that chases the latest target in tiny increments, so between
+    two slow frame updates the servo receives ~50 micro-writes and the motion
+    looks continuous.
+
+    Drop-in replacement for HardwarePWM / PWMOutputDevice from the main loop's
+    perspective: assigning ``.value = x`` sets a new target, reading ``.value``
+    returns the chase position (so threshold/slew checks see real position).
+
+    The underlying PWM is exposed as ``.pwm`` so the shutdown ramp can bypass
+    the interpolator and write directly during the wind-down sequence.
+    """
+
+    def __init__(self, pwm, max_step: float = 0.0008, interval: float = 0.005):
+        self.pwm       = pwm
+        self._target   = pwm.value
+        self._current  = pwm.value
+        self._max_step = max_step
+        self._interval = interval
+        self._lock     = threading.Lock()
+        self._stop     = threading.Event()
+        self._thread   = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @property
+    def value(self) -> float:
+        return self._current
+
+    @value.setter
+    def value(self, v: float):
+        with self._lock:
+            self._target = max(0.0, min(1.0, v))
+
+    def _run(self):
+        while not self._stop.is_set():
+            with self._lock:
+                target = self._target
+            diff = target - self._current
+            if abs(diff) > 1e-6:
+                if abs(diff) <= self._max_step:
+                    self._current = target
+                else:
+                    self._current += self._max_step if diff > 0 else -self._max_step
+                self.pwm.value = self._current
+            time.sleep(self._interval)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
 
 
 # ── Linear Actuator ───────────────────────────────────────────────────────────
@@ -293,6 +469,31 @@ class LinearActuator:
         self._en.close()
 
 
+# ── Servo Ramp ────────────────────────────────────────────────────────────────
+
+def move_servo_smoothly(pwm, start_duty: float, target_duty: float,
+                        step: float = SERVO_RAMP_STEP,
+                        interval: float = SERVO_RAMP_INTERVAL,
+                        clamp_min: float = 0.1, clamp_max: float = 0.9) -> float:
+    """Ramp a servo from start_duty to target_duty in small increments."""
+    current = max(clamp_min, min(clamp_max, start_duty))
+    target  = max(clamp_min, min(clamp_max, target_duty))
+    pwm.value = current
+
+    if abs(target - current) < 1e-9:
+        return target
+
+    direction = 1.0 if target > current else -1.0
+    while (direction > 0 and current < target) or (direction < 0 and current > target):
+        current += direction * step
+        if (direction > 0 and current > target) or (direction < 0 and current < target):
+            current = target
+        pwm.value = current
+        time.sleep(interval)
+
+    return target
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -309,19 +510,36 @@ def main():
                         help="Disable preview window (headless)")
     parser.add_argument("--no-gpio",     action="store_true",
                         help="Disable GPIO (run on desktop for testing)")
-    # PID tuning
-    parser.add_argument("--kp",          type=float, default=DEFAULT_KP)
-    parser.add_argument("--ki",          type=float, default=DEFAULT_KI)
-    parser.add_argument("--kd",          type=float, default=DEFAULT_KD)
+    # PID profile
+    parser.add_argument("--profile",     type=str, default=DEFAULT_PROFILE,
+                        choices=list(PID_PROFILES.keys()),
+                        help=f"PID tuning profile (default: {DEFAULT_PROFILE})")
+    # PID tuning (overrides profile if set)
+    parser.add_argument("--kp",          type=float, default=None)
+    parser.add_argument("--ki",          type=float, default=None)
+    parser.add_argument("--kd",          type=float, default=None)
     # Deadzone
-    parser.add_argument("--deadzone-x",  type=float, default=DEFAULT_DZ_X,
+    parser.add_argument("--deadzone-x",  type=float, default=None,
                         help="Horizontal deadzone fraction (0.0-0.5)")
-    parser.add_argument("--deadzone-y",  type=float, default=DEFAULT_DZ_Y,
+    parser.add_argument("--deadzone-y",  type=float, default=None,
                         help="Vertical deadzone fraction (0.0-0.5)")
     # Smoothing
-    parser.add_argument("--ema",         type=float, default=DEFAULT_EMA,
+    parser.add_argument("--ema",         type=float, default=None,
                         help="EMA smoothing alpha (0=none, 0.9=heavy)")
     args = parser.parse_args()
+
+    # Apply profile, then allow CLI overrides
+    prof = PID_PROFILES[args.profile]
+    if args.kp is None:         args.kp = prof["kp"]
+    if args.ki is None:         args.ki = prof["ki"]
+    if args.kd is None:         args.kd = prof["kd"]
+    if args.ema is None:        args.ema = prof["ema"]
+    if args.deadzone_x is None: args.deadzone_x = prof["dz_x"]
+    if args.deadzone_y is None: args.deadzone_y = prof["dz_y"]
+    global MAX_SLEW
+    MAX_SLEW = prof["slew"]
+    print(f"Profile: {args.profile} — kp={args.kp} ki={args.ki} kd={args.kd} "
+          f"ema={args.ema} slew={MAX_SLEW} dz={args.deadzone_x}/{args.deadzone_y}")
 
     # ── Load model ────────────────────────────────────────────────────────────
     model_path = Path(args.model)
@@ -334,16 +552,37 @@ def main():
     # ── GPIO setup ────────────────────────────────────────────────────────────
     pwm_yaw = pwm_roll = actuator = factory = None
     if not args.no_gpio:
-        from gpiozero import PWMOutputDevice
         from gpiozero.pins.lgpio import LGPIOFactory
-        factory  = LGPIOFactory()
-        pwm_yaw  = PWMOutputDevice(YAW_PIN,  frequency=PWM_FREQ, pin_factory=factory)
-        pwm_roll = PWMOutputDevice(ROLL_PIN, frequency=PWM_FREQ, pin_factory=factory)
+        factory = LGPIOFactory()
+
+        # Use hardware PWM if available (zero jitter), fall back to software
+        try:
+            pwm_yaw  = HardwarePWM(YAW_PIN,  PWM_FREQ)
+            pwm_roll = HardwarePWM(ROLL_PIN, PWM_FREQ)
+            print("Using HARDWARE PWM (sysfs) — jitter-free")
+        except (OSError, PermissionError, ValueError) as e:
+            print(f"Hardware PWM unavailable ({e}), falling back to software PWM")
+            from gpiozero import PWMOutputDevice
+            pwm_yaw  = PWMOutputDevice(YAW_PIN,  frequency=PWM_FREQ, pin_factory=factory)
+            pwm_roll = PWMOutputDevice(ROLL_PIN, frequency=PWM_FREQ, pin_factory=factory)
+
         actuator = LinearActuator(ACT_DIR_PIN, ACT_EN_PIN, factory)
         pwm_yaw.value  = SERVO_NEUTRAL
         pwm_roll.value = SERVO_NEUTRAL
         print(f"GPIO ready — Yaw:GPIO{YAW_PIN}  Roll:GPIO{ROLL_PIN}  "
               f"Actuator:GPIO{ACT_DIR_PIN}+{ACT_EN_PIN}")
+        # Gentle startup sweep to starting positions
+        print("Sweeping servos to start position...")
+        move_servo_smoothly(pwm_roll, SERVO_NEUTRAL, SERVO_VERTICAL_START)
+        print("Ready.")
+
+        # Wrap PWMs with the inter-frame interpolator. From here on, the main
+        # loop sets a target with `pwm_*.value = ...` and the background
+        # thread chases it at 200 Hz, eliminating the 250 ms "step + pause"
+        # pattern caused by the slow ~4 FPS detection cadence.
+        pwm_yaw  = SmoothServo(pwm_yaw)
+        pwm_roll = SmoothServo(pwm_roll)
+        print("Smooth servo interpolator running at 200 Hz.")
 
     # ── MJPEG stream ──────────────────────────────────────────────────────────
     reader = MjpegReader(args.source, (RES_W, RES_H), args.insecure)
@@ -351,7 +590,7 @@ def main():
     print(f"Connecting to {args.source} ...")
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
-        if reader.get_frame() is not None:
+        if reader.get_frame()[0] is not None:
             break
         time.sleep(0.1)
     else:
@@ -369,7 +608,10 @@ def main():
     duty_roll  = SERVO_NEUTRAL
     ema_x = ema_y = None
     hold_count    = 0
+    dz_settle_x   = 0   # consecutive frames x-error has been in deadzone
+    dz_settle_y   = 0
     t_prev        = time.monotonic()
+    last_frame_id = -1
 
     print("Tracking started. Press Q in preview window or Ctrl+C to quit.")
     print(f"PID kp={args.kp} ki={args.ki} kd={args.kd}  "
@@ -377,14 +619,16 @@ def main():
 
     try:
         while True:
-            frame = reader.get_frame()
-            if frame is None:
-                time.sleep(0.01)
+            frame, frame_id = reader.get_frame()
+            if frame is None or frame_id == last_frame_id:
+                time.sleep(0.005)
                 continue
+            last_frame_id = frame_id
+            frame = cv2.flip(frame, 1)  # mirror horizontally
 
             frame  = frame.copy()
             fH, fW = frame.shape[:2]
-            cx_mid = fW / 2.0
+            cx_mid = fW / 2.0 + (CAMERA_OFFSET_X * fW)
             cy_mid = fH / 2.0
 
             t_now  = time.monotonic()
@@ -406,8 +650,8 @@ def main():
                     ema_x, ema_y = raw_x, raw_y
                 else:
                     a = args.ema
-                    ema_x = a * raw_x + (1 - a) * ema_x
-                    ema_y = a * raw_y + (1 - a) * ema_y
+                    ema_x = (1 - a) * raw_x + a * ema_x
+                    ema_y = (1 - a) * raw_y + a * ema_y
 
                 # Draw detection
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -415,6 +659,10 @@ def main():
                 cv2.putText(frame, conf_text, (x1, y1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 cv2.circle(frame, (int(ema_x), int(ema_y)), 5, (0, 255, 255), -1)
+                # Draw 5 facial keypoints
+                for (kx, ky, kv), color in zip(primary["keypoints"], KPT_COLORS):
+                    if kv > 0.3:
+                        cv2.circle(frame, (int(kx), int(ky)), 4, color, -1)
             else:
                 hold_count += 1
                 if hold_count > HOLD_FRAMES:
@@ -423,32 +671,74 @@ def main():
                     pid_yaw.reset()
                     pid_roll.reset()
 
-            # ── Servo + actuator control ──────────────────────────────────
+
+            # ── Servo + actuator control (PID + latency compensation) ────
             if ema_x is not None and not args.no_gpio:
                 # Normalised error: -0.5 to +0.5
-                # Positive err_x = face is to the right  → pan right (increase duty)
-                # Positive err_y = face is below centre  → tilt down (increase duty)
                 err_x = (ema_x - cx_mid) / fW
                 err_y = (ema_y - cy_mid) / fH
 
-                # Apply deadzone (zero out small errors)
+                # Apply deadzone — don't reset PID, just feed zero error
+                # so the derivative term gently brakes instead of snapping back.
+                # Once settled in deadzone, slowly nudge toward true center.
+                raw_err_x = err_x   # keep original for centering
+                raw_err_y = err_y
                 if abs(err_x) < args.deadzone_x:
+                    dz_settle_x += 1
                     err_x = 0.0
-                    pid_yaw.reset()
+                else:
+                    dz_settle_x = 0
                 if abs(err_y) < args.deadzone_y:
+                    dz_settle_y += 1
                     err_y = 0.0
-                    pid_roll.reset()
+                else:
+                    dz_settle_y = 0
 
-                # PID update → duty delta
-                duty_yaw  += pid_yaw.update(err_x, dt)
-                duty_roll += pid_roll.update(err_y, dt)
+                # Latency compensation: if the servo is already moving
+                # toward the face (error and last delta have same sign),
+                # reduce the output — the stale frame hasn't caught up yet.
+                raw_yaw  = pid_yaw.update(err_x, dt)
+                raw_roll = pid_roll.update(err_y, dt)
+
+                # If error is shrinking (derivative is opposite to error),
+                # we're converging — apply a brake to prevent overshoot.
+                # The derivative term in PID already does some of this,
+                # but with latency we need extra dampening.
+                CONVERGE_BRAKE = 0.4   # reduce output by this factor when converging
+                if err_x != 0 and (err_x * pid_yaw._prev_err) > 0:
+                    # Same sign → still chasing, check if error is shrinking
+                    if abs(err_x) < abs(pid_yaw._prev_err):
+                        raw_yaw *= CONVERGE_BRAKE
+                if err_y != 0 and (err_y * pid_roll._prev_err) > 0:
+                    if abs(err_y) < abs(pid_roll._prev_err):
+                        raw_roll *= CONVERGE_BRAKE
+
+                delta_yaw  = max(-MAX_SLEW, min(MAX_SLEW, raw_yaw))
+                delta_roll = max(-MAX_SLEW, min(MAX_SLEW, raw_roll))
+
+                duty_yaw  += delta_yaw
+                duty_roll -= delta_roll   # inverted pitch
+
+                # Centering nudge: face is in deadzone and settled — slowly
+                # creep toward true center so the arm faces the user properly
+                if dz_settle_x >= CENTER_SETTLE_FRAMES and abs(raw_err_x) > 0.01:
+                    nudge_x = CENTER_SPEED if raw_err_x > 0 else -CENTER_SPEED
+                    duty_yaw += nudge_x
+                if dz_settle_y >= CENTER_SETTLE_FRAMES and abs(raw_err_y) > 0.01:
+                    nudge_y = CENTER_SPEED if raw_err_y > 0 else -CENTER_SPEED
+                    duty_roll -= nudge_y  # inverted pitch
+
                 duty_yaw   = max(SERVO_MIN, min(SERVO_MAX, duty_yaw))
                 duty_roll  = max(SERVO_MIN, min(SERVO_MAX, duty_roll))
 
+                # Push the new target to the SmoothServo interpolator. The
+                # background thread chases it at 200 Hz, so we don't need to
+                # filter or threshold here — every update should flow through.
                 pwm_yaw.value  = duty_yaw
                 pwm_roll.value = duty_roll
 
                 # Linear actuator: fires only when vertical error is large
+                err_y = (ema_y - cy_mid) / fH
                 if abs(err_y) > ACT_DEADZONE_Y:
                     direction = LinearActuator.DOWN if err_y > 0 else LinearActuator.UP
                     actuator.trigger(direction, ACT_PULSE_MS, ACT_COOLDOWN_S)
@@ -493,11 +783,19 @@ def main():
         print("Shutting down...")
         reader.stop()
         if not args.no_gpio:
-            pwm_yaw.value  = SERVO_NEUTRAL
-            pwm_roll.value = SERVO_NEUTRAL
-            time.sleep(0.3)
-            pwm_yaw.close()
-            pwm_roll.close()
+            # Stop the interpolator threads, then ramp the underlying PWMs
+            # directly to the rest position. move_servo_smoothly() needs the
+            # raw HardwarePWM, not the SmoothServo wrapper.
+            print("Returning servos to neutral...")
+            raw_yaw  = pwm_yaw.pwm
+            raw_roll = pwm_roll.pwm
+            pwm_yaw.stop()
+            pwm_roll.stop()
+            move_servo_smoothly(raw_yaw,  raw_yaw.value,  SERVO_NEUTRAL)
+            move_servo_smoothly(raw_roll, raw_roll.value, SERVO_SLEEP_PITCH)
+            time.sleep(0.2)
+            raw_yaw.close()
+            raw_roll.close()
             actuator.close()
         cv2.destroyAllWindows()
         print("Done.")
