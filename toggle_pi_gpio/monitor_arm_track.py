@@ -526,6 +526,10 @@ def main():
     # Smoothing
     parser.add_argument("--ema",         type=float, default=None,
                         help="EMA smoothing alpha (0=none, 0.9=heavy)")
+    # Step-response data capture
+    parser.add_argument("--log",         type=str, default=None,
+                        help="Path to a CSV file to log per-frame state (for "
+                             "step-response analysis). If unset, no logging is performed.")
     args = parser.parse_args()
 
     # Apply profile, then allow CLI overrides
@@ -616,6 +620,22 @@ def main():
     print("Tracking started. Press Q in preview window or Ctrl+C to quit.")
     print(f"PID kp={args.kp} ki={args.ki} kd={args.kd}  "
           f"deadzone x={args.deadzone_x} y={args.deadzone_y}  ema={args.ema}")
+
+    # ── Optional CSV logger for step-response capture ─────────────────────────
+    log_writer = None
+    log_file = None
+    log_t0 = None
+    if args.log:
+        import csv as _csv
+        log_file = open(args.log, "w", newline="")
+        log_writer = _csv.writer(log_file)
+        log_writer.writerow([
+            "t_s", "raw_x", "raw_y", "ema_x", "ema_y",
+            "duty_yaw", "duty_roll", "deadzone_x_px", "deadzone_y_px",
+            "frame_w", "frame_h", "profile",
+        ])
+        log_t0 = time.monotonic()
+        print(f"Logging per-frame state to {args.log}")
 
     try:
         while True:
@@ -737,6 +757,18 @@ def main():
                 pwm_yaw.value  = duty_yaw
                 pwm_roll.value = duty_roll
 
+                # ── CSV logging (step-response capture) ───────────────────────
+                if log_writer is not None:
+                    log_writer.writerow([
+                        f"{time.monotonic() - log_t0:.4f}",
+                        f"{raw_x:.2f}", f"{raw_y:.2f}",
+                        f"{ema_x:.2f}", f"{ema_y:.2f}",
+                        f"{duty_yaw:.5f}", f"{duty_roll:.5f}",
+                        f"{args.deadzone_x * fW:.1f}",
+                        f"{args.deadzone_y * fH:.1f}",
+                        fW, fH, args.profile,
+                    ])
+
                 # Linear actuator: fires only when vertical error is large
                 err_y = (ema_y - cy_mid) / fH
                 if abs(err_y) > ACT_DEADZONE_Y:
@@ -781,6 +813,9 @@ def main():
 
     finally:
         print("Shutting down...")
+        if log_file is not None:
+            log_file.close()
+            print(f"Log written to {args.log}")
         reader.stop()
         if not args.no_gpio:
             # Stop the interpolator threads, then ramp the underlying PWMs
