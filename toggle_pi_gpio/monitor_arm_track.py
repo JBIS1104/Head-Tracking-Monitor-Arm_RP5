@@ -82,7 +82,7 @@ PID_PROFILES = {
         "ema": 0.80, "slew": 0.010,
         "dz_x": 0.18, "dz_y": 0.13,
     },
-    "cinematic": {      # Slow, buttery — good for video/presentation
+    "cinematic": {      # Slow — good for video/presentation
         "kp": 0.025, "ki": 0.0001, "kd": 0.30,
         "ema": 0.90, "slew": 0.006,
         "dz_x": 0.22, "dz_y": 0.15,
@@ -318,9 +318,10 @@ HW_PWM_CHANNELS = {18: 2, 13: 1}
 HW_PWM_PIN_ALT  = {18: "a3", 13: "a0"}
 
 class HardwarePWM:
-    """Jitter-free hardware PWM via /sys/class/pwm (RP1 on RPi 5).
-    Requires running as root (sudo) — sysfs blocks non-root writes regardless
-    of file permissions. Keeps the duty_cycle fd open for zero-overhead writes."""
+    """Hardware PWM via /sys/class/pwm (RP1 on RPi 5).
+    Requires running as root: sysfs blocks non-root writes regardless of file
+    permissions. The duty_cycle fd is held open to avoid an open()/close() per
+    frame."""
 
     def __init__(self, gpio_pin: int, frequency: int = 400):
         channel = HW_PWM_CHANNELS.get(gpio_pin)
@@ -373,22 +374,11 @@ class HardwarePWM:
 # ── Smooth Servo Interpolator ────────────────────────────────────────────────
 
 class SmoothServo:
-    """Inter-frame interpolator for servo PWM.
-
-    The detection loop runs at ~4 FPS (one update every ~250 ms). Writing the
-    PWM directly from that loop produces visibly stepped motion: the servo
-    jumps, sits for 250 ms, jumps again. This wrapper runs a background thread
-    at ~200 Hz that chases the latest target in tiny increments, so between
-    two slow frame updates the servo receives ~50 micro-writes and the motion
-    looks continuous.
-
-    Drop-in replacement for HardwarePWM / PWMOutputDevice from the main loop's
-    perspective: assigning ``.value = x`` sets a new target, reading ``.value``
-    returns the chase position (so threshold/slew checks see real position).
-
-    The underlying PWM is exposed as ``.pwm`` so the shutdown ramp can bypass
-    the interpolator and write directly during the wind-down sequence.
-    """
+    """Inter-frame interpolator for servo PWM. Detection runs at ~4 FPS, so
+    writing the PWM directly produces visibly stepped motion. A 200 Hz
+    background thread chases the latest target in small steps. Same .value
+    interface as HardwarePWM; the underlying PWM is exposed as .pwm for the
+    shutdown ramp to bypass the interpolator."""
 
     def __init__(self, pwm, max_step: float = 0.0008, interval: float = 0.005):
         self.pwm       = pwm
@@ -563,7 +553,7 @@ def main():
         try:
             pwm_yaw  = HardwarePWM(YAW_PIN,  PWM_FREQ)
             pwm_roll = HardwarePWM(ROLL_PIN, PWM_FREQ)
-            print("Using HARDWARE PWM (sysfs) — jitter-free")
+            print("Using HARDWARE PWM (sysfs)")
         except (OSError, PermissionError, ValueError) as e:
             print(f"Hardware PWM unavailable ({e}), falling back to software PWM")
             from gpiozero import PWMOutputDevice

@@ -15,7 +15,7 @@ Key folders to restore:
 - `Servo Testing/`
 - `toggle_pi_gpio/`
 - `Yolo desktop/`
-- `CLAUDE.md`, `RECOVERY.md`
+- `RECOVERY.md`
 
 ---
 
