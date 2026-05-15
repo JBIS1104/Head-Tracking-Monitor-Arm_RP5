@@ -3,6 +3,12 @@
 Companion code repository for the BEng dissertation *Head-Tracking Monitor Arm*
 (Junbyung Park, 10936972, EEEN30330, 2025/26).
 
+> **Note on this README.** The source code in this repository was written by
+> the author. The explanatory prose in this README (the architecture summaries,
+> diagrams, and "Technical Details" section) was drafted with the help of an
+> AI assistant to make the repository easier for visitors to follow, then
+> reviewed and edited by the author for accuracy.
+
 ## 1. Introduction
 
 This repository contains the on-device software that runs on a Raspberry Pi 5
